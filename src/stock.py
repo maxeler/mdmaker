@@ -41,6 +41,7 @@ FIELDS = ['timestamp', 'secid', 'trade_valid', 'book_valid']
 
 MIN_TIME_DELTA_NANOS = 200
 MAX_TIME_DELTA_NANOS = 100000000
+
 def now_nanos():
     """Returns the current simulation time in nanoseconds"""
     if now_nanos.sim_time == 0:
@@ -175,12 +176,12 @@ class OrderBook(object):
 
         # Trim list
         if order.side == Side.SELL:
-            # Delete from end of list
+            # Delete from end of list - highest offers
             if len(self.offer) > MAX_DEPTH:
                 for i in range(len(self.offer) - MAX_DEPTH):
                     del self.offer[-1]
         else:
-            # Delete from start of list
+            # Delete from start of list - lowest bids
             if len(self.bid) > MAX_DEPTH:
                 for i in range(len(self.bid) - MAX_DEPTH):
                     del self.bid[0]
@@ -334,6 +335,25 @@ class OrderBook(object):
         row.update({TRADE_FORMAT.format(f) : None for f in TRADE_FIELDS})
         self.csv.writerow(row)
 
+    def csv_trade_update(self, trades):
+        """
+            Add row to CSV file for the trades
+        """
+        for trade in trades:
+            row = {'timestamp' : now_nanos(),
+                   'secid' : self.security,
+                   'trade_valid' : True,
+                   'book_valid' : 'False'}
+            trade_dict = trade._asdict()
+            row.update({
+                LEVEL_FORMAT.format(1, 'bid', f) : None for f in LEVEL_FIELDS
+                })
+            row.update({
+                LEVEL_FORMAT.format(1, 'offer', f) : None for f in LEVEL_FIELDS
+                })
+            row.update({TRADE_FORMAT.format(f) : trade_dict[f] for f in TRADE_FIELDS})
+            self.csv.writerow(row)
+
     def bin_book_update(self):
         """
             Adds a binary entry to the file
@@ -360,25 +380,6 @@ class OrderBook(object):
                            *the_data)
         self.file.write(data)
 
-    def csv_trade_update(self, trades):
-        """
-            Add row to CSV file for the trades
-        """
-        for trade in trades:
-            row = {'timestamp' : now_nanos(),
-                   'secid' : self.security,
-                   'trade_valid' : True,
-                   'book_valid' : 'False'}
-            trade_dict = trade._asdict()
-            row.update({
-                LEVEL_FORMAT.format(1, 'bid', f) : None for f in LEVEL_FIELDS
-                })
-            row.update({
-                LEVEL_FORMAT.format(1, 'offer', f) : None for f in LEVEL_FIELDS
-                })
-            row.update({TRADE_FORMAT.format(f) : trade_dict[f] for f in TRADE_FIELDS})
-            self.csv.writerow(row)
-
     def bin_trade_update(self, trades):
         """
             Adds a binary entry to the file
@@ -395,7 +396,7 @@ class OrderBook(object):
             valids_fmt = "I"
             valids_data = [1]
             the_data = [now_nanos(), self.security] + \
-                    trade_update_data + order_book_level_data + valids_data
+                       trade_update_data + order_book_level_data + valids_data
             data = struct.pack("<QI" + trade_update_fmt + order_book_level_fmt * 5 + valids_fmt,
                                *the_data)
             self.file.write(data)
@@ -560,7 +561,7 @@ def parse_args(argv):
 
     parser.add_argument("-o", "--output", dest="outputfile",
                         help="Output file name",
-                        action="store", type=argparse.FileType(mode='bw'), default="md")
+                        action="store", type=argparse.FileType(mode='wb'), default="md")
 
     return parser.parse_args(argv)
 
