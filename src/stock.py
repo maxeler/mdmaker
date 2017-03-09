@@ -4,7 +4,6 @@ Market data generator script.
 """
 
 import argparse
-import bisect
 import csv
 import itertools
 import math
@@ -12,7 +11,6 @@ import random
 import struct
 import sys
 import time
-import warnings
 from enum import Enum
 from functools import reduce
 
@@ -20,9 +18,6 @@ import numpy
 from matplotlib import pyplot
 from recordclass import recordclass
 from sortedcontainers import SortedListWithKey
-
-# all new resting orders will be placed qith qty 1
-# book is kept with at least one level on bid and offer
 
 MIN_TICK = 0.01
 MAX_TICK = 20 * MIN_TICK
@@ -38,9 +33,16 @@ LEVEL_FIELDS = ['price', 'qty', 'order_count']
 TRADE_FIELDS = ['price', 'qty', 'aggressor']
 FIELDS = ['timestamp', 'secid', 'trade_valid', 'book_valid']
 
-
 MIN_TIME_DELTA_NANOS = 200
 MAX_TIME_DELTA_NANOS = 100000000
+
+OrderBookLevel = recordclass('OrderBookLevel',
+                             LEVEL_FIELDS)
+Order = recordclass('Order', ['secid', 'side', 'price', 'qty'])
+Trade = recordclass('Trade', TRADE_FIELDS)
+
+LEVEL_FORMAT = "lvl{}_{}_{}"
+TRADE_FORMAT = "trade_{}"
 
 def now_nanos():
     """Returns the current simulation time in nanoseconds"""
@@ -58,13 +60,72 @@ class Side(Enum):
     BUY = 1
     SELL = 2
 
-OrderBookLevel = recordclass('OrderBookLevel',
-                             LEVEL_FIELDS)
-Order = recordclass('Order', ['secid', 'side', 'price', 'qty'])
-Trade = recordclass('Trade', TRADE_FIELDS)
+class OrderBookUtils(object):
+    """Utility class for OrderBook manipulation"""
+    @staticmethod
+    def cross(bid, offer):
+        """
+            Check if two levels can cross
+        """
+        if bid.price >= offer.price:
+            remaining_qty = min(offer.qty - bid.qty, MAX_QTY)
+            return (True, remaining_qty)
 
-LEVEL_FORMAT = "lvl{}_{}_{}"
-TRADE_FORMAT = "trade_{}"
+        return (False, 0)
+
+    @staticmethod
+    def compact(levels, start):
+        """
+            Compacts an order list, such that orders at the same price level are merged.
+            This assumes the order list is sorted.
+        """
+
+        # print("Compacting book")
+        # self.print()
+        last_level = None
+        for i in range(start, -1, -1):
+            level = levels[i]
+            if last_level:
+                if level.price == last_level.price:
+                    last_level.qty += level.qty
+                    last_level.order_count += level.order_count
+                    del levels[i]
+                else:
+                    break
+            else:
+                last_level = level
+
+    @staticmethod
+    def reduce_book_value(level1, level2):
+        """
+            Reduction function for price * qty
+        """
+        value1 = level1
+        value2 = level2
+        if isinstance(level1, OrderBookLevel):
+            value1 = level1.price * level1.qty
+        if isinstance(level2, OrderBookLevel):
+            value2 = level2.price * level2.qty
+        return value1 + value2
+
+    @staticmethod
+    def qty(levels, at_level):
+        """Get qty at sepcific level"""
+        if len(levels) > at_level:
+            return levels[at_level].qty
+        return 0
+
+    @staticmethod
+    def book_value(levels):
+        """
+            Computes the value of open orders on a list of book levels
+        """
+        if len(levels) > 1:
+            return reduce(OrderBookUtils.reduce_book_value, levels)
+        elif len(levels) > 0:
+            return levels[0].price * levels[0].qty
+        else:
+            raise Exception("Cannot reduce empty book")
 
 class OrderBook(object):
     """An Order Book data model"""
@@ -86,15 +147,7 @@ class OrderBook(object):
         self.csv = csv.DictWriter(f=self.file, fieldnames=fields)
         self.csv.writeheader()
 
-    def cross(self, bid, offer):
-        """
-            Check if two levels can cross
-        """
-        if bid.price >= offer.price:
-            remaining_qty = min(offer.qty - bid.qty, MAX_QTY)
-            return (True, remaining_qty)
 
-        return (False, 0)
 
     def match(self, aggressor_side):
         """
@@ -110,7 +163,7 @@ class OrderBook(object):
             offer_i = 0
             while offer_i < size_offer:
                 offer = self.offer[offer_i]
-                (crossed, remaining_qty) = self.cross(bid, offer)
+                (crossed, remaining_qty) = OrderBookUtils.cross(bid, offer)
                 if crossed:
                     trade = Trade(price=offer.price, qty=offer.qty, aggressor=aggressor_side)
                     stop = False
@@ -132,28 +185,6 @@ class OrderBook(object):
                     return trades
         return trades
 
-
-    def compact(self, levels, start):
-        """
-            Compacts an order list, such that orders at the same price level are merged.
-            This assumes the order list is sorted.
-        """
-
-        # print("Compacting book")
-        # self.print()
-        last_level = None
-        for i in range(start, -1, -1):
-            level = levels[i]
-            if last_level:
-                if level.price == last_level.price:
-                    last_level.qty += level.qty
-                    last_level.order_count += level.order_count
-                    del levels[i]
-                else:
-                    break
-            else:
-                last_level = level
-
     def order(self, order):
         """
             Apply an order to the Order Book.
@@ -172,18 +203,20 @@ class OrderBook(object):
         new_level = OrderBookLevel(price=order.price, qty=order.qty, order_count=1)
         start_index = levels.bisect_right(new_level)
         levels.insert(start_index, new_level)
-        self.compact(levels, start_index)
+        OrderBookUtils.compact(levels, start_index)
 
         # Trim list
         if order.side == Side.SELL:
             # Delete from end of list - highest offers
-            if len(self.offer) > MAX_DEPTH:
-                for i in range(len(self.offer) - MAX_DEPTH):
+            size = len(self.offer)
+            if size > MAX_DEPTH:
+                for _ in itertools.repeat(None, size - MAX_DEPTH):
                     del self.offer[-1]
         else:
             # Delete from start of list - lowest bids
-            if len(self.bid) > MAX_DEPTH:
-                for i in range(len(self.bid) - MAX_DEPTH):
+            size = len(self.bid)
+            if size > MAX_DEPTH:
+                for _ in itertools.repeat(None, size - MAX_DEPTH):
                     del self.bid[0]
 
         return self.match(order.side)
@@ -206,40 +239,17 @@ class OrderBook(object):
 
         return 0
 
-    def reduce_book_value(self, level1, level2):
-        """
-            Reduction function for price * qty
-        """
-        value1 = level1
-        value2 = level2
-        if isinstance(level1, OrderBookLevel):
-            value1 = level1.price * level1.qty
-        if isinstance(level2, OrderBookLevel):
-            value2 = level2.price * level2.qty
-        return value1 + value2
-
-    def book_value(self, levels):
-        """
-            Computes the value of open orders on a list of book levels
-        """
-        if len(levels) > 1:
-            return reduce(self.reduce_book_value, levels)
-        elif len(levels) > 0:
-            return levels[0].price * levels[0].qty
-        else:
-            raise Exception("Cannot reduce empty book")
-
     def value_offers(self):
         """
             Returns the value of offers on the book
         """
-        return self.book_value(self.offer)
+        return OrderBookUtils.book_value(self.offer)
 
     def value_bids(self):
         """
             Returns the value of bids on the book
         """
-        return self.book_value(self.bid)
+        return OrderBookUtils.book_value(self.bid)
 
     def depth_offers(self):
         """
@@ -265,19 +275,13 @@ class OrderBook(object):
             return self.offer[0].price
         return None
 
-    def qty(self, levels, at_level):
-        """Get qty at sepcific level"""
-        if len(levels) > at_level:
-            return levels[at_level].qty
-        return 0
-
     def bid_qty(self, at_level):
         """Get qty at sepcific level"""
-        return self.qty(self.bid, at_level)
+        return OrderBookUtils.qty(self.bid, at_level)
 
     def offer_qty(self, at_level):
         """Get qty at sepcific level"""
-        return self.qty(self.offer, -at_level)
+        return OrderBookUtils.qty(self.offer, -at_level)
 
     def aggregate_bid_qty(self, trade_price):
         """Sum of qty that would match a price"""
