@@ -127,27 +127,136 @@ class OrderBookUtils(object):
         else:
             raise Exception("Cannot reduce empty book")
 
+    @staticmethod
+    def pad_book(book, depth, price, side):
+        """
+            Add orders to the book such that we are at full depths.
+        """
+        orders = []
+        sign = -1.0 if side == Side.BUY else 1.0
+        if depth < MAX_DEPTH:
+            num = MAX_DEPTH - depth
+            best = price
+            offset = 1
+            for _ in itertools.repeat(None, num):
+                orders += [Order(secid=book.security,
+                                 side=side,
+                                 price=round(best + sign * offset *
+                                             MIN_TICK, DECIMALS),
+                                 qty=random.randint(1, 10))]
+                offset += random.randint(1, 3)
+        return orders
+
+    @staticmethod
+    def csv_header(file):
+        """
+            Write the CSV header to the output file
+        """
+        fields = FIELDS + \
+                 [LEVEL_FORMAT.format(1, 'bid', field) for field in reversed(LEVEL_FIELDS)] + \
+                 [LEVEL_FORMAT.format(1, 'offer', field) for field in LEVEL_FIELDS] + \
+                 [TRADE_FORMAT.format(field) for field in TRADE_FIELDS]
+        csvfile = csv.DictWriter(f=file, fieldnames=fields)
+        csvfile.writeheader()
+        return csvfile
+
+    @staticmethod
+    def csv_book_update(csvfile, book):
+        """
+            Add row to CSV file with current book state.
+        """
+        row = {'timestamp' : now_nanos(),
+               'secid' : book.security,
+               'trade_valid' : False,
+               'book_valid' : 'True'}
+        bid = book.bid[-1]._asdict()
+        offer = book.offer[0]._asdict()
+        row.update({
+            LEVEL_FORMAT.format(1, 'bid', f) : bid[f] for f in LEVEL_FIELDS
+            })
+        row.update({
+            LEVEL_FORMAT.format(1, 'offer', f) : offer[f] for f in LEVEL_FIELDS
+            })
+        row.update({TRADE_FORMAT.format(f) : None for f in TRADE_FIELDS})
+        csvfile.writerow(row)
+
+    @staticmethod
+    def csv_trade_update(csvfile, book, trades):
+        """
+            Add row to CSV file for the trades
+        """
+        for trade in trades:
+            row = {'timestamp' : now_nanos(),
+                   'secid' : book.security,
+                   'trade_valid' : True,
+                   'book_valid' : 'False'}
+            trade_dict = trade._asdict()
+            row.update({
+                LEVEL_FORMAT.format(1, 'bid', f) : None for f in LEVEL_FIELDS
+                })
+            row.update({
+                LEVEL_FORMAT.format(1, 'offer', f) : None for f in LEVEL_FIELDS
+                })
+            row.update({TRADE_FORMAT.format(f) : trade_dict[f] for f in TRADE_FIELDS})
+            csvfile.writerow(row)
+
+    @staticmethod
+    def bin_book_update(binfile, book):
+        """
+            Adds a binary entry to the file
+        """
+        trade_update_fmt = "II"
+        trade_update_data = [0, 0]
+        order_book_level_fmt = "IIIIII"
+        levels = [
+            (book.bid[-(i+1)].price * DECIMAL_CONVERT,
+             book.bid[-(i+1)].qty,
+             book.bid[-(i+1)].order_count,
+             book.offer[i].price * DECIMAL_CONVERT,
+             book.offer[i].qty,
+             book.offer[i].order_count) for i in range(5)]
+        order_book_level_data = []
+        for data in levels:
+            order_book_level_data += list(data)
+        order_book_level_data = [int(v) for v in order_book_level_data]
+        valids_fmt = "I"
+        valids_data = [2]
+        the_data = [now_nanos(), book.security] + \
+                   trade_update_data + order_book_level_data + valids_data
+        data = struct.pack("<QI" + trade_update_fmt + order_book_level_fmt * 5 + valids_fmt,
+                           *the_data)
+        binfile.write(data)
+
+    @staticmethod
+    def bin_trade_update(binfile, book, trades):
+        """
+            Adds a binary entry to the file
+        """
+        for trade in trades:
+            trade_update_fmt = "II"
+            trade_update_data = [int(trade.price * DECIMAL_CONVERT), trade.qty]
+            order_book_level_fmt = "IIIIII"
+            levels = [(0, 0, 0, 0, 0, 0) for i in range(5)]
+            order_book_level_data = []
+            for data in levels:
+                order_book_level_data += list(data)
+            order_book_level_data = [int(v) for v in order_book_level_data]
+            valids_fmt = "I"
+            valids_data = [1]
+            the_data = [now_nanos(), book.security] + \
+                       trade_update_data + order_book_level_data + valids_data
+            data = struct.pack("<QI" + trade_update_fmt + order_book_level_fmt * 5 + valids_fmt,
+                               *the_data)
+            binfile.write(data)
+
+
 class OrderBook(object):
     """An Order Book data model"""
     def __init__(self, security, file):
         self.bid = SortedListWithKey(key=(lambda level: level.price))
         self.offer = SortedListWithKey(key=(lambda level: level.price))
         self.security = security
-        self.csv = None
-        self.file = file
-
-    def use_csv(self):
-        """
-            Use a CSV output file rather than binary
-        """
-        fields = FIELDS + \
-                 [LEVEL_FORMAT.format(1, 'bid', field) for field in reversed(LEVEL_FIELDS)] + \
-                 [LEVEL_FORMAT.format(1, 'offer', field) for field in LEVEL_FIELDS] + \
-                 [TRADE_FORMAT.format(field) for field in TRADE_FIELDS]
-        self.csv = csv.DictWriter(f=self.file, fieldnames=fields)
-        self.csv.writeheader()
-
-
+        self.mids = []
 
     def match(self, aggressor_side):
         """
@@ -229,6 +338,10 @@ class OrderBook(object):
             return (self.bid[-1].price + self.offer[0].price) / 2.0
 
         raise Exception("No bids / offers!")
+
+    def update_mid_series(self):
+        """Adds current mid price to the mid series"""
+        self.mids += [self.mid()]
 
     def spread(self):
         """
@@ -320,209 +433,113 @@ class OrderBook(object):
             print("{0:^10},{1:^10},{2:^10} | {3:^10}, {4:^10}, {5:^10}".format(
                 bid.order_count, bid.qty, bid.price, offer.price, offer.qty, offer.order_count))
 
-    def csv_book_update(self):
-        """
-            Add row to CSV file with current book state.
-        """
-        row = {'timestamp' : now_nanos(),
-               'secid' : self.security,
-               'trade_valid' : False,
-               'book_valid' : 'True'}
-        bid = self.bid[-1]._asdict()
-        offer = self.offer[0]._asdict()
-        row.update({
-            LEVEL_FORMAT.format(1, 'bid', f) : bid[f] for f in LEVEL_FIELDS
-            })
-        row.update({
-            LEVEL_FORMAT.format(1, 'offer', f) : offer[f] for f in LEVEL_FIELDS
-            })
-        row.update({TRADE_FORMAT.format(f) : None for f in TRADE_FIELDS})
-        self.csv.writerow(row)
+    def gen_orders(self, config):
+        """Generator function for the mid price"""
+        upper_bound = config.base + config.bound * MIN_TICK
+        lower_bound = config.base - config.bound * MIN_TICK
+        mid = config.base + random.randint(-config.bound + 1, config.bound - 1) * MIN_TICK
+        direction = 1.0
 
-    def csv_trade_update(self, trades):
-        """
-            Add row to CSV file for the trades
-        """
-        for trade in trades:
-            row = {'timestamp' : now_nanos(),
-                   'secid' : self.security,
-                   'trade_valid' : True,
-                   'book_valid' : 'False'}
-            trade_dict = trade._asdict()
-            row.update({
-                LEVEL_FORMAT.format(1, 'bid', f) : None for f in LEVEL_FIELDS
-                })
-            row.update({
-                LEVEL_FORMAT.format(1, 'offer', f) : None for f in LEVEL_FIELDS
-                })
-            row.update({TRADE_FORMAT.format(f) : trade_dict[f] for f in TRADE_FIELDS})
-            self.csv.writerow(row)
+        for i in range(config.samples):
+            if i % config.variation == 0:
+                if mid >= upper_bound:
+                    direction = -1.0
+                elif mid <= lower_bound:
+                    direction = 1.0
+                elif random.randint(0, 1) == 0:
+                    direction = -1.0
+                else:
+                    direction = 1.0
 
-    def bin_book_update(self):
-        """
-            Adds a binary entry to the file
-        """
-        trade_update_fmt = "II"
-        trade_update_data = [0, 0]
-        order_book_level_fmt = "IIIIII"
-        levels = [
-            (self.bid[-(i+1)].price * DECIMAL_CONVERT,
-             self.bid[-(i+1)].qty,
-             self.bid[-(i+1)].order_count,
-             self.offer[i].price * DECIMAL_CONVERT,
-             self.offer[i].qty,
-             self.offer[i].order_count) for i in range(5)]
-        order_book_level_data = []
-        for data in levels:
-            order_book_level_data += list(data)
-        order_book_level_data = [int(v) for v in order_book_level_data]
-        valids_fmt = "I"
-        valids_data = [2]
-        the_data = [now_nanos(), self.security] + \
-                   trade_update_data + order_book_level_data + valids_data
-        data = struct.pack("<QI" + trade_update_fmt + order_book_level_fmt * 5 + valids_fmt,
-                           *the_data)
-        self.file.write(data)
+            mid += direction * random.randint(1, 10) * MIN_TICK
 
-    def bin_trade_update(self, trades):
-        """
-            Adds a binary entry to the file
-        """
-        for trade in trades:
-            trade_update_fmt = "II"
-            trade_update_data = [int(trade.price * DECIMAL_CONVERT), trade.qty]
-            order_book_level_fmt = "IIIIII"
-            levels = [(0, 0, 0, 0, 0, 0) for i in range(5)]
-            order_book_level_data = []
-            for data in levels:
-                order_book_level_data += list(data)
-            order_book_level_data = [int(v) for v in order_book_level_data]
-            valids_fmt = "I"
-            valids_data = [1]
-            the_data = [now_nanos(), self.security] + \
-                       trade_update_data + order_book_level_data + valids_data
-            data = struct.pack("<QI" + trade_update_fmt + order_book_level_fmt * 5 + valids_fmt,
-                               *the_data)
-            self.file.write(data)
+            # if mid <= lower_bound:
+            #     mid = lower_bound
 
-def gen_orders(config, book):
-    """Generator function for the mid price"""
-    upper_bound = config.base + config.bound
-    lower_bound = config.base - config.bound
-    mid = config.base
-    direction = 1.0
+            # if mid >= upper_bound:
+            #     mid = upper_bound
 
-    for i in range(config.samples):
-        if i % config.variation == 0:
-            if mid >= upper_bound:
-                direction = -1.0
-            elif mid <= lower_bound:
-                direction = 1.0
-            elif random.randint(0, 1) == 0:
-                direction = -1.0
+            orders = []
+            sell_price = mid + MIN_TICK
+            buy_price = mid - MIN_TICK
+            if direction < 0:
+                qty = self.aggregate_bid_qty(sell_price)
+                orders += [Order(secid=self.security,
+                                 side=Side.SELL,
+                                 price=round(sell_price, DECIMALS),
+                                 qty=qty + 1)]
+                orders += [Order(secid=self.security,
+                                 side=Side.BUY,
+                                 price=round(buy_price, DECIMALS),
+                                 qty=1)]
             else:
-                direction = 1.0
+                qty = self.aggregate_offer_qty(buy_price)
+                orders += [Order(secid=self.security,
+                                 side=Side.BUY,
+                                 price=round(buy_price, DECIMALS),
+                                 qty=qty+1)]
+                orders += [Order(secid=self.security,
+                                 side=Side.SELL,
+                                 price=round(sell_price, DECIMALS),
+                                 qty=1)]
 
-        mid += direction * random.randint(1, 10) * MIN_TICK
+            orders += OrderBookUtils.pad_book(self, self.depth_bids(), buy_price, Side.BUY)
+            orders += OrderBookUtils.pad_book(self, self.depth_offers(), sell_price, Side.SELL)
 
-        if mid <= lower_bound:
-            mid = lower_bound
-
-        if mid >= upper_bound:
-            mid = upper_bound
-
-        orders = []
-        sell_price = mid + MIN_TICK
-        buy_price = mid - MIN_TICK
-        if direction < 0:
-            qty = book.aggregate_bid_qty(sell_price)
-            orders += [Order(secid=config.instrument,
-                             side=Side.SELL,
-                             price=round(sell_price, DECIMALS),
-                             qty=qty + 1)]
-            orders += [Order(secid=config.instrument,
-                             side=Side.BUY,
-                             price=round(buy_price, DECIMALS),
-                             qty=1)]
-        else:
-            qty = book.aggregate_offer_qty(buy_price)
-            orders += [Order(secid=config.instrument,
-                             side=Side.BUY,
-                             price=round(buy_price, DECIMALS),
-                             qty=qty+1)]
-            orders += [Order(secid=config.instrument,
-                             side=Side.SELL,
-                             price=round(sell_price, DECIMALS),
-                             qty=1)]
-
-        orders += pad_book(config, book.depth_bids(), buy_price, Side.BUY)
-        orders += pad_book(config, book.depth_offers(), sell_price, Side.SELL)
-
-        yield (orders, mid)
-
-def pad_book(config, depth, price, side):
-    """
-        Add orders to the book such that we are at full depths.
-    """
-    orders = []
-    sign = -1.0 if side == Side.BUY else 1.0
-    if depth < MAX_DEPTH:
-        num = MAX_DEPTH - depth
-        best = price
-        offset = 1
-        for _ in itertools.repeat(None, num):
-            orders += [Order(secid=config.instrument,
-                             side=side,
-                             price=round(best + sign * offset * MIN_TICK, DECIMALS),
-                             qty=random.randint(1, 10))]
-            offset += random.randint(1, 3)
-    return orders
+            yield (orders, mid)
 
 def gen_book(config):
     """Generate order book"""
     print("Using random seed: ", config.randseed)
     random.seed(config.randseed)
 
-    book = OrderBook(security=config.instrument, file=config.outputfile)
+    books = []
+    for sec in config.instruments:
+        books += [OrderBook(security=sec, file=config.outputfile)]
 
     if config.csv:
-        book.use_csv()
+        OrderBookUtils.csv_header(config.outputfile)
 
-    # Initialize book
-    for i in range(config.depth):
-        delta = (i+1) * 1.0
-        book.order(Order(secid=config.instrument,
-                         side=Side.BUY, price=(config.base - delta), qty=1))
-        book.order(Order(secid=config.instrument,
-                         side=Side.SELL, price=(config.base + delta), qty=1))
+    # Initialize books
+    for book in books:
+        for i in range(MAX_DEPTH):
+            delta = (i+1) * 1.0
+            book.order(Order(secid=book.security,
+                             side=Side.BUY, price=(config.base - delta), qty=1))
+            book.order(Order(secid=book.security,
+                             side=Side.SELL, price=(config.base + delta), qty=1))
 
-    bid_series = []
-    offer_series = []
-    mid_series = []
-    book_mid_series = []
-    for (orders, mid) in gen_orders(config, book):
-        # book.print()
-        # print("Target mid --> {}".format(mid))
-        for order in orders:
-            # print("New order: ", order)
-            trades = book.order(order)
+    rem_books = [book for book in books]
+    generators = [book.gen_orders(config) for book in books]
+
+    while generators:
+        index = random.randint(0, len(generators)-1)
+        book = rem_books[index]
+        gen = generators[index]
+        try:
+            (orders, mid) = next(gen)
+            # book.print()
+            # print("Target mid --> {}".format(mid))
+            for order in orders:
+                # print("New order: ", order)
+                trades = book.order(order)
+                if config.csv:
+                    OrderBookUtils.csv_trade_update(config.outputfile, book, trades)
+                else:
+                    OrderBookUtils.bin_trade_update(config.outputfile, book, trades)
+
             if config.csv:
-                book.csv_trade_update(trades)
+                OrderBookUtils.csv_book_update(config.outputfile, book)
             else:
-                book.bin_trade_update(trades)
+                OrderBookUtils.bin_book_update(config.outputfile, book)
 
-        if config.csv:
-            book.csv_book_update()
-        else:
-            book.bin_book_update()
+            book.update_mid_series()
+        except StopIteration:
+            del generators[index]
+            del rem_books[index]
 
-        mid_series += [mid]
-        book_mid_series += [book.mid()]
-        bid_series += [book.best_bid()]
-        offer_series += [book.best_offer()]
 
-    book.print()
-    return (bid_series, offer_series, mid_series, book_mid_series)
+    return [book.mids for book in books]
 
 def parse_args(argv):
     """Parse command line arguments"""
@@ -539,13 +556,10 @@ def parse_args(argv):
                         help="Use CSV format [default Binary]",
                         action="store_true", default=False)
 
-    parser.add_argument("-d", "--depth", dest="depth",
-                        help="Book depth",
-                        action="store", type=int, default=5)
-
-    parser.add_argument("-i", "--instrument", dest="instrument",
-                        help="Security ID",
-                        action="store", type=int, default=123456)
+    parser.add_argument("-i", "--instruments", dest="instruments",
+                        help="Security IDs, space separated list", type=int,
+                        nargs='+',
+                        action="store", default=666666)
 
     parser.add_argument("-v", "--variation", dest="variation",
                         help="Change in direction - lower is more often",
@@ -553,7 +567,7 @@ def parse_args(argv):
 
     parser.add_argument("-u", "--bound", dest="bound",
                         help="Price bound",
-                        action="store", type=float, default=100.0)
+                        action="store", type=int, default=1000)
 
     parser.add_argument("-g", "--debug", dest="debug",
                         help="Enable debugging",
@@ -583,12 +597,11 @@ def main(argv):
         args.outputfile.close()
         args.outputfile = open(name, "w")
 
-    (bid_series, offer_series, mid_series, book_mid_series) = gen_book(args)
+    mids = gen_book(args)
+    colors = ['blue', 'green', 'red', 'cyan', 'magenta', 'yellow', 'black']
 
-    # pyplot.plot(range(args.samples), numpy.array(mid_series), 'blue')
-    pyplot.plot(range(args.samples), numpy.array(bid_series), 'green')
-    pyplot.plot(range(args.samples), numpy.array(offer_series), 'red')
-    # pyplot.plot(range(args.samples), numpy.array(book_mid_series), 'black')
+    for (i, series) in enumerate(mids):
+        pyplot.plot(range(args.samples), numpy.array(series), colors[i % len(colors)])
     pyplot.show()
 
 
